@@ -1,11 +1,21 @@
-import { renderInkCommands } from '../domain/inkEngine';
-import { nextRotation, renderProcessedWorksheetImage } from '../domain/scanProcessor';
+import { normalizePoint, renderInkCommands } from '../domain/inkEngine';
+import {
+  loadImageElement,
+  nextRotation,
+  renderProcessedWorksheetImage,
+} from '../domain/scanProcessor';
 import type {
+  NormalizedPoint,
   PenColor,
   RotationDegree,
   ScanFilterMode,
   WorksheetRecord,
 } from '../domain/types';
+import {
+  bakeWhiteoutOntoImage,
+  renderWhiteoutOverlay,
+  rgbToHex,
+} from '../domain/whiteoutEngine';
 import { decodeBackupBundle, encodeBackupBundle } from '../storage/backupCodec';
 import type { WorksheetRepository } from '../storage/worksheetRepo';
 import {
@@ -17,6 +27,17 @@ import {
   undoControllerInk,
   type CanvasControllerState,
 } from './canvasController';
+import {
+  applyPickedPaperColor,
+  createInitialCleanupState,
+  handleCleanupPointerDown,
+  handleCleanupPointerMove,
+  handleCleanupPointerUpOrCancel,
+  resetCleanup,
+  setCleanupTool,
+  undoCleanup,
+  type CleanupControllerState,
+} from './cleanupController';
 
 interface ScanDraft {
   readonly sourceUrl: string;
@@ -28,6 +49,14 @@ interface ScanDraft {
   readonly title: string;
 }
 
+type CleanupOrigin =
+  | { readonly kind: 'scan-draft'; readonly draft: ScanDraft }
+  | {
+      readonly kind: 'existing';
+      readonly worksheet: WorksheetRecord;
+      readonly returnTo: 'library' | 'practice';
+    };
+
 type ViewState =
   | { readonly screen: 'library'; readonly worksheets: readonly WorksheetRecord[] }
   | {
@@ -35,6 +64,17 @@ type ViewState =
       readonly worksheet: WorksheetRecord;
       readonly canvasState: CanvasControllerState;
       readonly zoomScale: number;
+    }
+  | {
+      readonly screen: 'cleanup';
+      readonly origin: CleanupOrigin;
+      readonly baseImageDataUrl: string;
+      readonly width: number;
+      readonly height: number;
+      readonly title: string;
+      readonly cleanupState: CleanupControllerState;
+      readonly zoomScale: number;
+      readonly clearInkOnSave: boolean;
     };
 
 const PEN_COLORS: readonly { readonly hex: PenColor; readonly label: string }[] = [
@@ -42,6 +82,12 @@ const PEN_COLORS: readonly { readonly hex: PenColor; readonly label: string }[] 
   { hex: '#2563eb', label: '藍' },
   { hex: '#dc2626', label: '紅' },
   { hex: '#16a34a', label: '綠' },
+];
+
+const CLEANUP_BRUSH_SIZES: readonly { readonly label: string; readonly ratio: number }[] = [
+  { label: '細', ratio: 0.014 },
+  { label: '中', ratio: 0.028 },
+  { label: '粗', ratio: 0.055 },
 ];
 
 function isStandalonePwa(): boolean {
@@ -84,6 +130,7 @@ export async function mountApp(
   let statusMessage: string | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let rafId: number | null = null;
+  let isSavingCleanup = false;
 
   const setStatus = (msg: string): void => {
     statusMessage = msg;
@@ -107,6 +154,24 @@ export async function mountApp(
     }
   };
 
+  const enterCleanupFromExisting = (
+    worksheet: WorksheetRecord,
+    returnTo: 'library' | 'practice',
+  ): void => {
+    state = {
+      screen: 'cleanup',
+      origin: { kind: 'existing', worksheet, returnTo },
+      baseImageDataUrl: worksheet.baseImageDataUrl,
+      width: worksheet.width,
+      height: worksheet.height,
+      title: worksheet.title,
+      cleanupState: createInitialCleanupState(),
+      zoomScale: 1,
+      clearInkOnSave: false,
+    };
+    render();
+  };
+
   const renderLibrary = (): void => {
     cleanupObservers();
     if (state.screen !== 'library') return;
@@ -118,7 +183,7 @@ export async function mountApp(
         <header class="topbar">
           <div>
             <h1>工作紙練習本</h1>
-            <p class="subtitle">雙層保護：隨時手寫、擦除與重練，底圖永遠保留</p>
+            <p class="subtitle">雙層保護：隨時手寫、擦除與重練，並支援先抹除紙上原答案</p>
           </div>
           <div class="topbar-actions">
             <button type="button" class="btn btn-secondary" data-action="export-backup">匯出備份</button>
@@ -136,7 +201,7 @@ export async function mountApp(
             : ''
         }
 
-        ${statusMessage ? `<div class="toast">${statusMessage}</div>` : ''}
+        ${statusMessage ? `<div class="toast">${escapeHtml(statusMessage)}</div>` : ''}
 
         <section class="scan-card">
           <div class="scan-actions">
@@ -160,13 +225,14 @@ export async function mountApp(
                     (ws) => `
                   <article class="ws-card">
                     <button type="button" class="ws-thumb-btn" data-action="open-ws" data-id="${ws.id}">
-                      <img src="${ws.baseImageDataUrl}" alt="${ws.title}" loading="lazy" />
+                      <img src="${ws.baseImageDataUrl}" alt="${escapeHtml(ws.title)}" loading="lazy" />
                     </button>
                     <div class="ws-meta">
                       <div class="ws-title">${escapeHtml(ws.title)}</div>
                       <div class="ws-info">筆跡：${ws.inkCommands.length} 筆 · 更新於 ${formatDate(ws.updatedAt)}</div>
                       <div class="ws-card-actions">
                         <button type="button" class="btn btn-primary btn-sm" data-action="open-ws" data-id="${ws.id}">開始練習</button>
+                        <button type="button" class="btn btn-secondary btn-sm" data-action="cleanup-ws" data-id="${ws.id}">🧹 整理底圖</button>
                         <button type="button" class="btn btn-danger-ghost btn-sm" data-action="delete-ws" data-id="${ws.id}">刪除</button>
                       </div>
                     </div>
@@ -196,6 +262,7 @@ export async function mountApp(
           <button type="button" class="btn ${draft.filter === 'high-contrast' ? 'btn-primary' : 'btn-secondary'}" data-action="toggle-filter">
             ${draft.filter === 'high-contrast' ? '✓ 掃瞄高對比增強中' : '切換黑白高對比'}
           </button>
+          <button type="button" class="btn btn-outline" data-action="cleanup-draft">🧹 抹除原有答案</button>
         </div>
         <label class="field-label">
           工作紙名稱
@@ -315,6 +382,16 @@ export async function mountApp(
       });
     });
 
+    root.querySelectorAll<HTMLElement>('[data-action="cleanup-ws"]').forEach((el) => {
+      el.addEventListener('click', async () => {
+        const id = el.dataset['id'];
+        if (!id) return;
+        const ws = await repo.getWorksheet(id);
+        if (!ws) return;
+        enterCleanupFromExisting(ws, 'library');
+      });
+    });
+
     root.querySelectorAll<HTMLElement>('[data-action="delete-ws"]').forEach((el) => {
       el.addEventListener('click', async () => {
         const id = el.dataset['id'];
@@ -326,7 +403,6 @@ export async function mountApp(
       });
     });
 
-    // Scan Modal events
     root.querySelector('[data-action="rotate-draft"]')?.addEventListener('click', () => {
       if (!scanDraft) return;
       void updateScanDraft(nextRotation(scanDraft.rotationDeg), scanDraft.filter);
@@ -337,6 +413,24 @@ export async function mountApp(
       const nextFilter: ScanFilterMode =
         scanDraft.filter === 'high-contrast' ? 'original' : 'high-contrast';
       void updateScanDraft(scanDraft.rotationDeg, nextFilter);
+    });
+
+    root.querySelector('[data-action="cleanup-draft"]')?.addEventListener('click', () => {
+      if (!scanDraft) return;
+      const currentDraft = scanDraft;
+      scanDraft = null;
+      state = {
+        screen: 'cleanup',
+        origin: { kind: 'scan-draft', draft: currentDraft },
+        baseImageDataUrl: currentDraft.previewUrl,
+        width: currentDraft.width,
+        height: currentDraft.height,
+        title: currentDraft.title,
+        cleanupState: createInitialCleanupState(),
+        zoomScale: 1,
+        clearInkOnSave: true,
+      };
+      render();
     });
 
     root.querySelector<HTMLInputElement>('[data-input="draft-title"]')?.addEventListener('input', (e) => {
@@ -430,6 +524,7 @@ export async function mountApp(
           </div>
 
           <div class="tool-group">
+            <button type="button" class="btn btn-secondary" data-action="cleanup-current-ws">🧹 整理底圖</button>
             <button type="button" class="btn btn-secondary" data-action="undo" ${canvasState.commands.length === 0 ? 'disabled' : ''}>↩ 上一步</button>
             <button type="button" class="btn btn-danger" data-action="ask-clear" ${canvasState.commands.length === 0 ? 'disabled' : ''}>🗑️ 一鍵清除</button>
           </div>
@@ -523,7 +618,7 @@ export async function mountApp(
         try {
           canvas.setPointerCapture(e.pointerId);
         } catch {
-          // 忽略部分瀏覽器模擬事件不支援 capture 的情況
+          // 忽略模擬事件不支援 capture 的情況
         }
         state = { ...state, canvasState: nextCanvasState };
         scheduleRedraw();
@@ -567,7 +662,6 @@ export async function mountApp(
       if (updated && state.screen === 'practice') {
         state = { ...state, worksheet: updated };
       }
-      // 更新工具列按鈕 disabled 狀態
       updateUndoClearButtons();
     };
 
@@ -587,6 +681,11 @@ export async function mountApp(
       showClearConfirm = false;
       state = { screen: 'library', worksheets: await repo.listWorksheets() };
       render();
+    });
+
+    root.querySelector('[data-action="cleanup-current-ws"]')?.addEventListener('click', () => {
+      if (state.screen !== 'practice') return;
+      enterCleanupFromExisting(state.worksheet, 'practice');
     });
 
     root.querySelector('[data-action="tool-pen"]')?.addEventListener('click', () => {
@@ -716,11 +815,429 @@ export async function mountApp(
     });
   };
 
+  const renderCleanup = (): void => {
+    cleanupObservers();
+    if (state.screen !== 'cleanup') return;
+
+    const { origin, baseImageDataUrl, width, height, cleanupState, zoomScale, clearInkOnSave } = state;
+    const hasEdits = cleanupState.commands.length > 0;
+    const existingHasInk =
+      origin.kind === 'existing' && origin.worksheet.inkCommands.length > 0;
+
+    root.innerHTML = `
+      <div class="practice-shell">
+        <header class="practice-toolbar cleanup-toolbar">
+          <div class="tool-group">
+            <button type="button" class="btn btn-secondary" data-action="cleanup-back">← 返回</button>
+            <span class="cleanup-badge">🧹 底圖整理（抹除原有答案）</span>
+          </div>
+
+          <div class="tool-group">
+            <button type="button" class="btn ${cleanupState.toolKind === 'brush' ? 'btn-primary' : 'btn-secondary'}" data-action="cleanup-tool-brush">🖌️ 塗白筆刷</button>
+            <button type="button" class="btn ${cleanupState.toolKind === 'rect' ? 'btn-primary' : 'btn-secondary'}" data-action="cleanup-tool-rect">⬜ 框選塗白</button>
+            <button type="button" class="btn ${cleanupState.toolKind === 'eyedropper' ? 'btn-primary' : 'btn-secondary'}" data-action="cleanup-tool-eyedropper">
+              💧 吸取紙色
+              <span class="swatch-dot" style="background:${cleanupState.fillColor}"></span>
+            </button>
+            ${
+              cleanupState.fillColor.toLowerCase() !== '#ffffff'
+                ? `<button type="button" class="btn btn-sm btn-secondary" data-action="cleanup-pure-white">純白</button>`
+                : ''
+            }
+          </div>
+
+          ${
+            cleanupState.toolKind === 'brush'
+              ? `<div class="tool-group">
+                  ${CLEANUP_BRUSH_SIZES.map(
+                    (s) => `
+                    <button
+                      type="button"
+                      class="btn btn-sm ${Math.abs(cleanupState.brushWidthRatio - s.ratio) < 0.002 ? 'btn-primary' : 'btn-secondary'}"
+                      data-action="cleanup-brush-size"
+                      data-ratio="${s.ratio}"
+                    >${s.label}</button>
+                  `,
+                  ).join('')}
+                </div>`
+              : ''
+          }
+
+          <div class="tool-group">
+            <button type="button" class="btn btn-secondary btn-sm" data-action="cleanup-zoom-out">－</button>
+            <span class="zoom-label">${Math.round(zoomScale * 100)}%</span>
+            <button type="button" class="btn btn-secondary btn-sm" data-action="cleanup-zoom-in">＋</button>
+            <button type="button" class="btn btn-secondary" data-action="cleanup-undo" ${!hasEdits ? 'disabled' : ''}>↩ 上一步</button>
+            <button type="button" class="btn btn-secondary" data-action="cleanup-reset" ${!hasEdits ? 'disabled' : ''}>重設</button>
+          </div>
+
+          <div class="tool-group">
+            ${
+              existingHasInk
+                ? `<label class="checkbox-inline">
+                    <input type="checkbox" ${clearInkOnSave ? 'checked' : ''} data-input="clear-ink-on-save" />
+                    更新時順便清除舊手寫
+                  </label>`
+                : ''
+            }
+            ${
+              origin.kind === 'scan-draft'
+                ? `<button type="button" class="btn btn-primary" data-action="cleanup-save-new" ${isSavingCleanup ? 'disabled' : ''}>💾 完成去答案並儲存</button>`
+                : `
+                  <button type="button" class="btn btn-outline" data-action="cleanup-save-as-copy" ${isSavingCleanup ? 'disabled' : ''}>另存新空白工作紙</button>
+                  <button type="button" class="btn btn-primary" data-action="cleanup-overwrite" ${!hasEdits || isSavingCleanup ? 'disabled' : ''}>💾 更新此工作紙底圖</button>
+                `
+            }
+          </div>
+        </header>
+
+        ${
+          cleanupState.toolKind === 'eyedropper'
+            ? `<div class="cleanup-hint">請在下方工作紙空白處點一下，系統會自動吸取紙張背景色並切回塗白工具。</div>`
+            : `<div class="cleanup-hint">提示：用「塗白筆刷」或「框選塗白」遮住原本答案後，點選右側儲存即永久生成乾淨底圖。</div>`
+        }
+
+        <main class="canvas-viewport">
+          <div class="canvas-stage" style="width: ${Math.round(zoomScale * 100)}%; max-width: ${Math.round(920 * zoomScale)}px; aspect-ratio: ${width} / ${height};">
+            <img class="worksheet-base" src="${baseImageDataUrl}" alt="${escapeHtml(state.title)}" draggable="false" />
+            <canvas class="ink-canvas ${cleanupState.toolKind === 'eyedropper' ? 'cursor-eyedropper' : ''}"></canvas>
+          </div>
+        </main>
+      </div>
+    `;
+
+    bindCleanupEvents();
+  };
+
+  const bindCleanupEvents = (): void => {
+    const canvas = root.querySelector<HTMLCanvasElement>('.ink-canvas');
+    const stage = root.querySelector<HTMLElement>('.canvas-stage');
+    if (!canvas || !stage || state.screen !== 'cleanup') return;
+
+    let samplingCanvas: HTMLCanvasElement | null = null;
+    const ensureSamplingCanvas = async (): Promise<HTMLCanvasElement> => {
+      if (samplingCanvas) return samplingCanvas;
+      if (state.screen !== 'cleanup') throw new Error('Invalid screen state');
+      const img = await loadImageElement(state.baseImageDataUrl);
+      const c = document.createElement('canvas');
+      c.width = state.width;
+      c.height = state.height;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, state.width, state.height);
+      }
+      samplingCanvas = c;
+      return c;
+    };
+
+    const pickColorAtPoint = async (pt: NormalizedPoint): Promise<void> => {
+      const c = await ensureSamplingCanvas();
+      const ctx = c.getContext('2d');
+      if (!ctx || state.screen !== 'cleanup') return;
+      const px = Math.min(c.width - 1, Math.max(0, Math.floor(pt.x * c.width)));
+      const py = Math.min(c.height - 1, Math.max(0, Math.floor(pt.y * c.height)));
+      const pixel = ctx.getImageData(px, py, 1, 1).data;
+      const hex = rgbToHex(pixel[0] ?? 255, pixel[1] ?? 255, pixel[2] ?? 255);
+      state = {
+        ...state,
+        cleanupState: applyPickedPaperColor(state.cleanupState, hex),
+      };
+      render();
+    };
+
+    const redrawCleanup = (): void => {
+      if (state.screen !== 'cleanup') return;
+      const rect = stage.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 3);
+      const pixelW = Math.round(rect.width * dpr);
+      const pixelH = Math.round(rect.height * dpr);
+      if (canvas.width !== pixelW || canvas.height !== pixelH) {
+        canvas.width = pixelW;
+        canvas.height = pixelH;
+      }
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const cmds = state.cleanupState.activeCommand
+        ? [...state.cleanupState.commands, state.cleanupState.activeCommand]
+        : state.cleanupState.commands;
+
+      renderWhiteoutOverlay(ctx, cmds, { width: rect.width, height: rect.height });
+    };
+
+    const scheduleRedraw = (): void => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        redrawCleanup();
+      });
+    };
+
+    redrawCleanup();
+    resizeObserver = new ResizeObserver(() => redrawCleanup());
+    resizeObserver.observe(stage);
+
+    canvas.addEventListener('pointerdown', (e: PointerEvent) => {
+      if (state.screen !== 'cleanup') return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+
+      if (state.cleanupState.toolKind === 'eyedropper') {
+        const pt = normalizePoint(e.clientX, e.clientY, rect, e.pressure);
+        void pickColorAtPoint(pt);
+        return;
+      }
+
+      const nextCleanup = handleCleanupPointerDown(
+        state.cleanupState,
+        {
+          pointerId: e.pointerId,
+          pointerType: e.pointerType,
+          clientX: e.clientX,
+          clientY: e.clientY,
+          pressure: e.pressure,
+        },
+        rect,
+        generateId('wo'),
+      );
+      if (nextCleanup !== state.cleanupState) {
+        try {
+          canvas.setPointerCapture(e.pointerId);
+        } catch {
+          // 忽略模擬事件不支援 capture 的情況
+        }
+        state = { ...state, cleanupState: nextCleanup };
+        scheduleRedraw();
+      }
+    });
+
+    canvas.addEventListener('pointermove', (e: PointerEvent) => {
+      if (state.screen !== 'cleanup') return;
+      if (state.cleanupState.activePointerId !== e.pointerId) return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      state = {
+        ...state,
+        cleanupState: handleCleanupPointerMove(
+          state.cleanupState,
+          {
+            pointerId: e.pointerId,
+            pointerType: e.pointerType,
+            clientX: e.clientX,
+            clientY: e.clientY,
+            pressure: e.pressure,
+          },
+          rect,
+        ),
+      };
+      scheduleRedraw();
+    });
+
+    const finishWhiteout = (e: PointerEvent): void => {
+      if (state.screen !== 'cleanup') return;
+      if (state.cleanupState.activePointerId !== e.pointerId) return;
+      const nextCleanup = handleCleanupPointerUpOrCancel(state.cleanupState, e.pointerId);
+      state = { ...state, cleanupState: nextCleanup };
+      render();
+    };
+
+    canvas.addEventListener('pointerup', finishWhiteout);
+    canvas.addEventListener('pointercancel', finishWhiteout);
+
+    root.querySelector('[data-action="cleanup-back"]')?.addEventListener('click', async () => {
+      if (state.screen !== 'cleanup') return;
+      if (state.origin.kind === 'scan-draft') {
+        scanDraft = state.origin.draft;
+        state = { screen: 'library', worksheets: await repo.listWorksheets() };
+        render();
+        return;
+      }
+      if (state.origin.returnTo === 'practice') {
+        state = {
+          screen: 'practice',
+          worksheet: state.origin.worksheet,
+          canvasState: createInitialCanvasState(state.origin.worksheet.inkCommands, false),
+          zoomScale: 1,
+        };
+      } else {
+        state = { screen: 'library', worksheets: await repo.listWorksheets() };
+      }
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-tool-brush"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, cleanupState: setCleanupTool(state.cleanupState, 'brush') };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-tool-rect"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, cleanupState: setCleanupTool(state.cleanupState, 'rect') };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-tool-eyedropper"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, cleanupState: setCleanupTool(state.cleanupState, 'eyedropper') };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-pure-white"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = {
+        ...state,
+        cleanupState: applyPickedPaperColor(state.cleanupState, '#ffffff'),
+      };
+      render();
+    });
+
+    root.querySelectorAll<HTMLElement>('[data-action="cleanup-brush-size"]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (state.screen !== 'cleanup') return;
+        const ratio = Number(btn.dataset['ratio']);
+        if (!Number.isFinite(ratio) || ratio <= 0) return;
+        state = {
+          ...state,
+          cleanupState: { ...state.cleanupState, brushWidthRatio: ratio },
+        };
+        render();
+      });
+    });
+
+    root.querySelector('[data-action="cleanup-zoom-in"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, zoomScale: Math.min(2, Number((state.zoomScale + 0.25).toFixed(2))) };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-zoom-out"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, zoomScale: Math.max(0.75, Number((state.zoomScale - 0.25).toFixed(2))) };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-undo"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, cleanupState: undoCleanup(state.cleanupState) };
+      render();
+    });
+
+    root.querySelector('[data-action="cleanup-reset"]')?.addEventListener('click', () => {
+      if (state.screen !== 'cleanup') return;
+      state = { ...state, cleanupState: resetCleanup(state.cleanupState) };
+      render();
+    });
+
+    root.querySelector<HTMLInputElement>('[data-input="clear-ink-on-save"]')?.addEventListener('change', (e) => {
+      if (state.screen !== 'cleanup') return;
+      const checked = (e.currentTarget as HTMLInputElement).checked;
+      state = { ...state, clearInkOnSave: checked };
+    });
+
+    const saveAsNewWorksheet = async (): Promise<void> => {
+      if (state.screen !== 'cleanup' || isSavingCleanup) return;
+      isSavingCleanup = true;
+      render();
+      try {
+        const bakedUrl = await bakeWhiteoutOntoImage(
+          state.baseImageDataUrl,
+          state.width,
+          state.height,
+          state.cleanupState.commands,
+        );
+        const now = Date.now();
+        const title =
+          state.origin.kind === 'scan-draft'
+            ? state.title.trim() || `工作紙 ${formatDate(now)}`
+            : `${state.title} (空白版)`;
+        const record: WorksheetRecord = {
+          id: generateId('ws'),
+          title,
+          createdAt: now,
+          updatedAt: now,
+          width: state.width,
+          height: state.height,
+          baseImageDataUrl: bakedUrl,
+          inkCommands: [],
+        };
+        await repo.saveWorksheet(record);
+        if (state.origin.kind === 'scan-draft') {
+          URL.revokeObjectURL(state.origin.draft.sourceUrl);
+        }
+        state = {
+          screen: 'practice',
+          worksheet: record,
+          canvasState: createInitialCanvasState([], false),
+          zoomScale: 1,
+        };
+      } finally {
+        isSavingCleanup = false;
+        render();
+      }
+    };
+
+    root.querySelector('[data-action="cleanup-save-new"]')?.addEventListener('click', () => {
+      void saveAsNewWorksheet();
+    });
+
+    root.querySelector('[data-action="cleanup-save-as-copy"]')?.addEventListener('click', () => {
+      void saveAsNewWorksheet();
+    });
+
+    root.querySelector('[data-action="cleanup-overwrite"]')?.addEventListener('click', async () => {
+      if (state.screen !== 'cleanup' || state.origin.kind !== 'existing' || isSavingCleanup) {
+        return;
+      }
+      isSavingCleanup = true;
+      render();
+      try {
+        const bakedUrl = await bakeWhiteoutOntoImage(
+          state.baseImageDataUrl,
+          state.width,
+          state.height,
+          state.cleanupState.commands,
+        );
+        const updated = await repo.updateBaseImage(
+          state.origin.worksheet.id,
+          bakedUrl,
+          state.clearInkOnSave,
+        );
+        if (updated) {
+          if (state.origin.returnTo === 'practice') {
+            state = {
+              screen: 'practice',
+              worksheet: updated,
+              canvasState: createInitialCanvasState(updated.inkCommands, false),
+              zoomScale: 1,
+            };
+          } else {
+            state = { screen: 'library', worksheets: await repo.listWorksheets() };
+            statusMessage = '已更新工作紙底圖';
+          }
+        }
+      } finally {
+        isSavingCleanup = false;
+        render();
+      }
+    });
+  };
+
   const render = (): void => {
-    if (state.screen === 'library') {
-      renderLibrary();
-    } else {
-      renderPractice();
+    switch (state.screen) {
+      case 'library':
+        renderLibrary();
+        break;
+      case 'practice':
+        renderPractice();
+        break;
+      case 'cleanup':
+        renderCleanup();
+        break;
     }
   };
 
