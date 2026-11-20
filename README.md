@@ -104,14 +104,3 @@ npm run build
     ├── scanProcessor.test.ts
     ├── whiteoutEngine.test.ts
     └── worksheetRepo.test.ts
-```
-```
-
----
-
-### 推送更新
-
-```bash
-git add README.md
-git commit -m "docs: add README with setup, Vercel deployment, and iPad PWA guide"
-git push
