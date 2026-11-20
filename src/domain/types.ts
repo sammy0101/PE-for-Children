@@ -27,6 +27,24 @@ export type InkCommand =
       readonly points: readonly NormalizedPoint[];
     };
 
+export type WhiteoutToolKind = 'brush' | 'rect' | 'eyedropper';
+
+export type WhiteoutCommand =
+  | {
+      readonly kind: 'brush';
+      readonly id: string;
+      readonly color: string;
+      readonly widthRatio: number;
+      readonly points: readonly NormalizedPoint[];
+    }
+  | {
+      readonly kind: 'rect';
+      readonly id: string;
+      readonly color: string;
+      readonly start: NormalizedPoint;
+      readonly end: NormalizedPoint;
+    };
+
 export type ScanFilterMode = 'original' | 'high-contrast';
 
 export type RotationDegree = 0 | 90 | 180 | 270;
