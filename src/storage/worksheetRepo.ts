@@ -13,6 +13,12 @@ export interface WorksheetRepository {
     inkCommands: readonly InkCommand[],
     updatedAt?: number,
   ): Promise<WorksheetRecord | null>;
+  updateBaseImage(
+    id: string,
+    baseImageDataUrl: string,
+    clearInk: boolean,
+    updatedAt?: number,
+  ): Promise<WorksheetRecord | null>;
   deleteWorksheet(id: string): Promise<void>;
   importWorksheets(records: readonly WorksheetRecord[]): Promise<number>;
 }
@@ -91,10 +97,32 @@ export function createWorksheetRepo(
         | undefined;
       if (!existing) return null;
 
-      // 雙層隔離不變量：絕對不修改 baseImageDataUrl 與原始尺寸
+      // 雙層隔離不變量：寫入筆跡時絕對不修改 baseImageDataUrl
       const updated: WorksheetRecord = {
         ...existing,
         inkCommands,
+        updatedAt,
+      };
+      await runTx(db, 'readwrite', (store) => store.put(updated));
+      return updated;
+    },
+
+    async updateBaseImage(
+      id: string,
+      baseImageDataUrl: string,
+      clearInk: boolean,
+      updatedAt = Date.now(),
+    ): Promise<WorksheetRecord | null> {
+      const db = await getDb();
+      const existing = (await runTx(db, 'readonly', (store) => store.get(id))) as
+        | WorksheetRecord
+        | undefined;
+      if (!existing) return null;
+
+      const updated: WorksheetRecord = {
+        ...existing,
+        baseImageDataUrl,
+        inkCommands: clearInk ? [] : existing.inkCommands,
         updatedAt,
       };
       await runTx(db, 'readwrite', (store) => store.put(updated));
