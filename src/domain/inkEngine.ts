@@ -18,9 +18,9 @@ export interface ViewportSize {
 }
 
 export interface InkCanvasContext2D {
-  globalCompositeOperation: string;
-  strokeStyle: string;
-  fillStyle: string;
+  globalCompositeOperation: GlobalCompositeOperation;
+  strokeStyle: string | CanvasGradient | CanvasPattern;
+  fillStyle: string | CanvasGradient | CanvasPattern;
   lineWidth: number;
   lineCap: CanvasLineCap;
   lineJoin: CanvasLineJoin;
@@ -29,7 +29,13 @@ export interface InkCanvasContext2D {
   moveTo(x: number, y: number): void;
   lineTo(x: number, y: number): void;
   quadraticCurveTo(cpx: number, cpy: number, x: number, y: number): void;
-  arc(x: number, y: number, radius: number, startAngle: number, endAngle: number): void;
+  arc(
+    x: number,
+    y: number,
+    radius: number,
+    startAngle: number,
+    endAngle: number,
+  ): void;
   stroke(): void;
   fill(): void;
 }
