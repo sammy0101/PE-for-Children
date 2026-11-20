@@ -90,7 +90,7 @@ body {
 
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 16px;
 }
 
@@ -147,8 +147,9 @@ body {
 
 .ws-card-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
 }
 
 .btn {
@@ -241,6 +242,44 @@ body {
   z-index: 10;
 }
 
+.cleanup-toolbar {
+  background: #fffbeb;
+  border-bottom-color: #fde68a;
+}
+
+.cleanup-badge {
+  font-weight: 700;
+  color: #92400e;
+  font-size: 0.95rem;
+}
+
+.cleanup-hint {
+  background: #fef3c7;
+  color: #78350f;
+  padding: 6px 14px;
+  font-size: 0.88rem;
+  text-align: center;
+  border-bottom: 1px solid #fde68a;
+}
+
+.swatch-dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1.5px solid #64748b;
+  display: inline-block;
+}
+
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+  padding: 4px 6px;
+}
+
 .practice-title {
   font-weight: 700;
   max-width: 180px;
@@ -306,6 +345,10 @@ body {
   height: 100%;
   touch-action: none;
   cursor: crosshair;
+}
+
+.ink-canvas.cursor-eyedropper {
+  cursor: copy;
 }
 
 .modal-backdrop {
